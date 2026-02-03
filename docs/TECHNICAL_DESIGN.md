@@ -1,4 +1,4 @@
-# 物料解析与内容生成 - 技术设计文档
+# YiYi 技术设计文档
 
 ## 一、物料解析系统
 
@@ -709,5 +709,400 @@ async function* generateContent(request: GenerateRequest) {
   }
 
   yield { status: 'completed', content: '' };
+}
+```
+
+---
+
+## 六、多模型适配系统
+
+参考 OpenClaw 项目的多模型架构设计，YiYi 支持多种 AI 模型提供商，并具备智能故障转移能力。
+
+### 6.1 系统架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      应用层                                  │
+│         物料解析 / 内容生成 / 智能问答                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   模型路由层                                 │
+│  - 模型选择                                                 │
+│  - 故障转移                                                 │
+│  - 负载均衡                                                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Anthropic   │  │   OpenAI     │  │   其他提供商  │
+│  Claude系列  │  │   GPT系列    │  │  Gemini/通义 │
+└──────────────┘  └──────────────┘  └──────────────┘
+```
+
+### 6.2 支持的模型提供商
+
+| 提供商 | 模型 | API类型 | 适用场景 |
+|--------|------|---------|----------|
+| **Anthropic** | Claude 3.5/4 | anthropic-messages | 主力模型，内容生成 |
+| **OpenAI** | GPT-4/4o | openai-completions | 备用模型 |
+| **Google** | Gemini Pro | google-generative-ai | 多模态解析 |
+| **阿里云** | 通义千问 | openai-compatible | 国内备用 |
+| **本地模型** | Ollama/LMStudio | openai-compatible | 离线使用 |
+
+### 6.3 配置结构设计
+
+#### 模型配置
+
+```typescript
+interface ModelConfig {
+  // 主模型配置
+  model: {
+    primary: string;        // 主模型 "provider/model"
+    fallbacks?: string[];   // 故障转移列表
+  };
+
+  // 图像处理模型（用于户型图、效果图解析）
+  imageModel?: {
+    primary: string;
+    fallbacks?: string[];
+  };
+
+  // 模型目录（可配置别名和参数）
+  models?: {
+    [key: string]: {
+      alias?: string;       // 别名，如 "fast", "smart"
+      params?: {            // 模型特定参数
+        temperature?: number;
+        maxTokens?: number;
+      };
+    };
+  };
+}
+```
+
+#### 提供商配置
+
+```typescript
+interface ProviderConfig {
+  [providerId: string]: {
+    baseUrl: string;                    // API端点
+    apiKey?: string;                    // API密钥
+    auth: 'api-key' | 'oauth' | 'token'; // 认证方式
+    api: ModelApi;                      // API类型
+    headers?: Record<string, string>;   // 自定义请求头
+    models: ModelDefinition[];          // 支持的模型列表
+  };
+}
+
+type ModelApi =
+  | 'openai-completions'      // OpenAI 兼容
+  | 'anthropic-messages'      // Anthropic 原生
+  | 'google-generative-ai';   // Google AI
+```
+
+#### 配置文件示例
+
+```json5
+// ~/.yiyi/config.json
+{
+  // 模型配置
+  "model": {
+    "primary": "anthropic/claude-sonnet-4-20250514",
+    "fallbacks": [
+      "openai/gpt-4o",
+      "qwen/qwen-max"
+    ]
+  },
+
+  // 图像模型（多模态）
+  "imageModel": {
+    "primary": "anthropic/claude-sonnet-4-20250514",
+    "fallbacks": ["google/gemini-pro-vision"]
+  },
+
+  // 模型别名
+  "models": {
+    "anthropic/claude-sonnet-4-20250514": { "alias": "default" },
+    "anthropic/claude-3-5-haiku-20241022": { "alias": "fast" },
+    "anthropic/claude-opus-4-20250514": { "alias": "smart" }
+  },
+
+  // 提供商配置
+  "providers": {
+    "anthropic": {
+      "apiKey": "${ANTHROPIC_API_KEY}"
+    },
+    "openai": {
+      "apiKey": "${OPENAI_API_KEY}"
+    },
+    "qwen": {
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "${QWEN_API_KEY}",
+      "api": "openai-completions"
+    },
+    "local": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions"
+    }
+  }
+}
+```
+
+### 6.4 故障转移机制
+
+#### 故障转移流程
+
+```typescript
+interface FailoverAttempt {
+  provider: string;
+  model: string;
+  error: Error;
+  reason: FailoverReason;
+  timestamp: number;
+}
+
+type FailoverReason =
+  | 'auth'        // 认证失败
+  | 'rate_limit'  // 速率限制
+  | 'timeout'     // 请求超时
+  | 'billing'     // 计费问题
+  | 'unavailable' // 服务不可用
+  | 'unknown';    // 未知错误
+
+async function runWithFallback<T>(
+  task: (provider: string, model: string) => Promise<T>,
+  config: ModelConfig
+): Promise<T> {
+  const candidates = [
+    config.model.primary,
+    ...(config.model.fallbacks || [])
+  ];
+
+  const attempts: FailoverAttempt[] = [];
+
+  for (const candidate of candidates) {
+    const [provider, model] = parseModelRef(candidate);
+
+    // 检查冷却状态
+    if (isInCooldown(provider)) {
+      attempts.push({ provider, model, reason: 'cooldown', ... });
+      continue;
+    }
+
+    try {
+      const result = await task(provider, model);
+      // 记录成功
+      recordSuccess(provider);
+      return result;
+    } catch (error) {
+      const reason = classifyError(error);
+      attempts.push({ provider, model, error, reason, ... });
+
+      // 根据错误类型决定是否继续
+      if (reason === 'auth' || reason === 'billing') {
+        // 认证/计费问题，进入冷却
+        setCooldown(provider, 30 * 60 * 1000); // 30分钟
+      }
+
+      // 继续尝试下一个模型
+      continue;
+    }
+  }
+
+  // 所有模型都失败
+  throw new AllModelsFailedError(attempts);
+}
+```
+
+#### 冷却机制
+
+```typescript
+interface CooldownState {
+  provider: string;
+  until: number;        // 冷却结束时间
+  reason: FailoverReason;
+  failCount: number;    // 连续失败次数
+}
+
+// 冷却时间策略（指数退避）
+function getCooldownDuration(failCount: number): number {
+  const base = 60 * 1000; // 1分钟
+  const max = 30 * 60 * 1000; // 最大30分钟
+  return Math.min(base * Math.pow(2, failCount - 1), max);
+}
+```
+
+### 6.5 认证管理
+
+#### 支持的认证方式
+
+```typescript
+// 1. API Key 认证（最常用）
+interface ApiKeyAuth {
+  type: 'api-key';
+  key: string;
+}
+
+// 2. OAuth 认证（支持自动刷新）
+interface OAuthAuth {
+  type: 'oauth';
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  clientId?: string;
+}
+
+// 3. 静态 Token 认证
+interface TokenAuth {
+  type: 'token';
+  token: string;
+  expiresAt?: number;
+}
+```
+
+#### 认证配置存储
+
+```typescript
+// ~/.yiyi/auth.json（加密存储）
+interface AuthStore {
+  version: number;
+  profiles: {
+    [profileId: string]: {
+      provider: string;
+      credential: ApiKeyAuth | OAuthAuth | TokenAuth;
+      email?: string;
+      createdAt: number;
+      lastUsed?: number;
+    };
+  };
+  // 每个提供商的认证顺序
+  order?: {
+    [provider: string]: string[];
+  };
+}
+```
+
+#### OAuth 自动刷新
+
+```typescript
+async function ensureValidToken(profile: OAuthProfile): Promise<string> {
+  // 检查是否即将过期（提前5分钟刷新）
+  if (profile.expiresAt - Date.now() < 5 * 60 * 1000) {
+    const newTokens = await refreshOAuthToken(profile);
+    await updateAuthStore(profile.id, newTokens);
+    return newTokens.accessToken;
+  }
+  return profile.accessToken;
+}
+```
+
+### 6.6 运行时模型切换
+
+#### 模型选择器
+
+```typescript
+interface ModelSelector {
+  // 解析模型引用
+  parseRef(ref: string): { provider: string; model: string };
+
+  // 通过别名获取模型
+  getByAlias(alias: string): ModelRef | null;
+
+  // 获取推荐模型（根据任务类型）
+  getRecommended(task: TaskType): ModelRef;
+
+  // 列出可用模型
+  listAvailable(): ModelRef[];
+}
+
+type TaskType =
+  | 'content_generation'  // 内容生成 - 需要创意
+  | 'data_extraction'     // 数据提取 - 需要准确
+  | 'image_analysis'      // 图像分析 - 需要多模态
+  | 'quick_query';        // 快速查询 - 需要速度
+```
+
+#### 任务级模型配置
+
+```typescript
+// 不同任务使用不同模型
+const taskModelMapping = {
+  // 内容生成：使用主力模型
+  content_generation: 'default',
+
+  // 数据提取：使用准确模型
+  data_extraction: 'smart',
+
+  // 快速查询：使用快速模型
+  quick_query: 'fast',
+
+  // 图像分析：使用多模态模型
+  image_analysis: 'imageModel'
+};
+```
+
+### 6.7 模型管理 API
+
+```typescript
+// 获取当前模型配置
+GET /api/models/config
+Response: ModelConfig
+
+// 更新模型配置
+PATCH /api/models/config
+Body: Partial<ModelConfig>
+
+// 列出可用模型
+GET /api/models/available
+Response: { models: ModelInfo[] }
+
+// 测试模型连接
+POST /api/models/test
+Body: { provider: string, model: string }
+Response: { success: boolean, latency: number, error?: string }
+
+// 获取模型使用统计
+GET /api/models/stats
+Response: {
+  usage: { [model: string]: { calls: number, tokens: number } },
+  errors: { [model: string]: { count: number, lastError: string } }
+}
+```
+
+### 6.8 本地模型支持
+
+支持通过 Ollama 或 LMStudio 运行本地模型，实现离线使用。
+
+```typescript
+// 本地模型配置
+const localProvider: ProviderConfig = {
+  local: {
+    baseUrl: 'http://localhost:11434/v1',  // Ollama 默认端口
+    api: 'openai-completions',
+    models: [
+      { id: 'llama3.1:8b', name: 'Llama 3.1 8B' },
+      { id: 'qwen2.5:7b', name: 'Qwen 2.5 7B' },
+      { id: 'llava:13b', name: 'LLaVA 13B (多模态)' }
+    ]
+  }
+};
+
+// 自动检测本地模型
+async function discoverLocalModels(): Promise<ModelInfo[]> {
+  try {
+    const response = await fetch('http://localhost:11434/api/tags');
+    const { models } = await response.json();
+    return models.map(m => ({
+      id: m.name,
+      provider: 'local',
+      size: m.size,
+      modifiedAt: m.modified_at
+    }));
+  } catch {
+    return []; // 本地服务未运行
+  }
 }
 ```

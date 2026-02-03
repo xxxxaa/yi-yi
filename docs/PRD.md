@@ -436,7 +436,7 @@ YiYi（易易）是一款面向房产中介从业者的AI智能助手，帮助�
 |------|------|
 | 前端 | React/Vue + TypeScript |
 | 网关 | Node.js + WebSocket |
-| AI引擎 | Claude API / 本地模型 |
+| AI引擎 | 多模型适配（见8.4） |
 | 数据库 | SQLite（本地）/ PostgreSQL |
 | 向量库 | Faiss / Chroma |
 | 文件存储 | 本地文件系统 |
@@ -450,6 +450,44 @@ YiYi（易易）是一款面向房产中介从业者的AI智能助手，帮助�
 | 视频处理 | FFmpeg |
 | 语音转写 | Whisper |
 | 表格解析 | xlsx / tabula |
+
+### 8.4 多模型适配
+
+参考 OpenClaw 架构，支持多种 AI 模型提供商，具备智能故障转移能力。
+
+#### 支持的模型提供商
+
+| 提供商 | 模型 | 适用场景 |
+|--------|------|----------|
+| Anthropic | Claude 3.5/4 系列 | 主力模型，内容生成 |
+| OpenAI | GPT-4/4o | 备用模型 |
+| Google | Gemini Pro | 多模态图像解析 |
+| 阿里云 | 通义千问 | 国内备用 |
+| 本地模型 | Ollama/LMStudio | 离线使用 |
+
+#### 核心特性
+
+- **故障转移**：主模型失败自动切换备用模型
+- **冷却机制**：失败后智能冷却，避免重复请求
+- **多认证方式**：API Key / OAuth / Token
+- **模型别名**：简化配置，如 "fast"、"smart"
+- **任务路由**：不同任务使用最适合的模型
+
+#### 配置示例
+
+```json5
+{
+  "model": {
+    "primary": "anthropic/claude-sonnet-4-20250514",
+    "fallbacks": ["openai/gpt-4o", "qwen/qwen-max"]
+  },
+  "imageModel": {
+    "primary": "anthropic/claude-sonnet-4-20250514"
+  }
+}
+```
+
+详细技术设计见 [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md#六多模型适配系统)
 
 ---
 
