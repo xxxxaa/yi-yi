@@ -1106,3 +1106,443 @@ async function discoverLocalModels(): Promise<ModelInfo[]> {
   }
 }
 ```
+
+---
+
+## 七、AI讲房系统
+
+### 7.1 3S快速讲房
+
+#### 生成逻辑
+
+```typescript
+interface ThreeSecondPitchRequest {
+  projectId: string;
+  emphasis: 'location' | 'price' | 'education' | 'quality' | 'layout';
+  targetAudience: 'first_time' | 'upgrader' | 'investor';
+  tone: 'professional' | 'friendly' | 'urgent';
+  includePrice: boolean;
+}
+
+// 生成Prompt模板
+const pitchPrompt = `
+你是一位资深房产经纪人。请根据以下楼盘信息，生成一句3秒内能说完的快速推荐话术。
+
+## 楼盘信息
+{project_info}
+
+## 要求
+1. 话术结构：[楼盘定位] + [核心卖点] + [价格/行动引导]
+2. 突出卖点：{emphasis}
+3. 目标客群：{targetAudience}
+4. 语气风格：{tone}
+5. 字数限制：30-50字
+6. ${includePrice ? '包含具体价格' : '不包含具体价格'}
+
+## 示例
+"XX花园，地铁口300米纯新盘，89平三房总价280万起，首付50万上车！"
+
+请生成话术：
+`;
+```
+
+### 7.2 AI讲房话术生成
+
+#### 场景模板
+
+```typescript
+interface TourScriptRequest {
+  projectId: string;
+  scene: 'sandbox' | 'showroom' | 'garden' | 'surrounding';
+  houseTypeId?: string;  // 样板间讲解需要指定户型
+  duration: 'short' | 'standard' | 'detailed';
+  includeQA: boolean;
+}
+
+// 沙盘讲解模板
+const sandboxTemplate = {
+  sections: [
+    { name: '开场白', duration: '30s', required: true },
+    { name: '区位介绍', duration: '1-2min', required: true },
+    { name: '项目规划', duration: '1-2min', required: true },
+    { name: '产品介绍', duration: '1min', required: true },
+    { name: '过渡引导', duration: '15s', required: true }
+  ]
+};
+
+// 样板间讲解模板
+const showroomTemplate = {
+  sections: [
+    { name: '入户玄关', duration: '30s', required: true },
+    { name: '客餐厅', duration: '1min', required: true },
+    { name: '主卧', duration: '1min', required: true },
+    { name: '次卧/书房', duration: '30s', required: false },
+    { name: '厨卫', duration: '30s', required: true },
+    { name: '阳台', duration: '30s', required: false },
+    { name: '总结', duration: '30s', required: true }
+  ]
+};
+```
+
+#### 异议处理库
+
+```typescript
+interface ObjectionHandler {
+  category: string;
+  questions: {
+    question: string;
+    answer: string;
+    tips: string[];
+  }[];
+}
+
+const commonObjections: ObjectionHandler[] = [
+  {
+    category: '价格异议',
+    questions: [
+      {
+        question: '价格太贵了',
+        answer: '您说的对，这个价格确实不低。但您看...',
+        tips: ['强调性价比', '对比周边', '分析升值空间']
+      }
+    ]
+  },
+  {
+    category: '户型异议',
+    questions: [
+      {
+        question: '这个户型有点小',
+        answer: '面积确实紧凑，但空间利用率很高...',
+        tips: ['强调得房率', '展示收纳设计', '对比同面积户型']
+      }
+    ]
+  }
+];
+```
+
+### 7.3 VR讲房
+
+#### VR场景识别
+
+```typescript
+interface VRSceneAnalysis {
+  sceneType: 'living_room' | 'bedroom' | 'kitchen' | 'bathroom' | 'balcony';
+  features: string[];
+  suggestedScript: string;
+}
+
+// 使用多模态模型分析VR截图
+async function analyzeVRScene(imageUrl: string): Promise<VRSceneAnalysis> {
+  const response = await claude.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'url', url: imageUrl } },
+        { type: 'text', text: '分析这个VR看房场景，识别房间类型和特点，生成讲解词' }
+      ]
+    }]
+  });
+  return parseVRAnalysis(response);
+}
+```
+
+#### 语音合成集成
+
+```typescript
+interface TTSConfig {
+  provider: 'azure' | 'aliyun' | 'local';
+  voice: string;
+  speed: number;
+  pitch: number;
+}
+
+async function generateVoiceNarration(
+  script: string,
+  config: TTSConfig
+): Promise<string> {
+  // 返回音频文件URL
+  const audioUrl = await ttsService.synthesize(script, config);
+  return audioUrl;
+}
+```
+
+---
+
+## 八、PPT生成系统
+
+### 8.1 PPT生成架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      PPT生成请求                             │
+│         楼盘ID / 模板类型 / 自定义选项                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      数据准备                                │
+│  - 楼盘基础信息                                             │
+│  - 户型数据                                                 │
+│  - 物料资源（图片、图表）                                    │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      内容生成                                │
+│  - AI生成文案                                               │
+│  - 数据可视化                                               │
+│  - 布局规划                                                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      PPT渲染                                 │
+│  - 模板应用                                                 │
+│  - 图片插入                                                 │
+│  - 样式调整                                                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      输出                                    │
+│         PPTX / PDF / 图片序列                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 PPT模板系统
+
+```typescript
+interface PPTTemplate {
+  id: string;
+  name: string;
+  description: string;
+  pageCount: { min: number; max: number };
+  style: 'simple' | 'business' | 'modern' | 'luxury';
+  colorScheme: {
+    primary: string;
+    secondary: string;
+    accent: string;
+    background: string;
+  };
+  pages: PPTPageTemplate[];
+}
+
+interface PPTPageTemplate {
+  type: 'cover' | 'content' | 'image' | 'comparison' | 'contact';
+  layout: string;
+  placeholders: {
+    id: string;
+    type: 'text' | 'image' | 'chart' | 'table';
+    position: { x: number; y: number; width: number; height: number };
+    style?: Record<string, any>;
+  }[];
+}
+```
+
+### 8.3 PPT生成API
+
+```typescript
+// 生成PPT
+POST /api/projects/{projectId}/ppt
+Body: {
+  templateId: string;
+  options: {
+    includePages: string[];      // 包含的页面类型
+    houseTypes: string[];        // 展示的户型
+    includePrice: boolean;
+    agentInfo?: {
+      name: string;
+      phone: string;
+      qrCode?: string;
+    };
+  };
+}
+Response: {
+  taskId: string;
+  status: 'processing';
+}
+
+// 查询生成状态
+GET /api/ppt/tasks/{taskId}
+Response: {
+  status: 'processing' | 'completed' | 'failed';
+  progress: number;
+  result?: {
+    pptxUrl: string;
+    pdfUrl: string;
+    previewImages: string[];
+  };
+}
+```
+
+### 8.4 技术实现
+
+```typescript
+// 使用 pptxgenjs 生成PPT
+import PptxGenJS from 'pptxgenjs';
+
+async function generatePPT(
+  project: Project,
+  template: PPTTemplate,
+  options: PPTOptions
+): Promise<Buffer> {
+  const pptx = new PptxGenJS();
+
+  // 设置主题
+  pptx.defineLayout({ name: 'LAYOUT_16x9', width: 10, height: 5.625 });
+  pptx.layout = 'LAYOUT_16x9';
+
+  // 生成封面
+  const coverSlide = pptx.addSlide();
+  await renderCoverPage(coverSlide, project, template);
+
+  // 生成内容页
+  for (const pageType of options.includePages) {
+    const slide = pptx.addSlide();
+    await renderContentPage(slide, project, pageType, template);
+  }
+
+  // 生成户型页
+  for (const houseTypeId of options.houseTypes) {
+    const houseType = project.houseTypes.find(h => h.id === houseTypeId);
+    if (houseType) {
+      const slide = pptx.addSlide();
+      await renderHouseTypePage(slide, houseType, template);
+    }
+  }
+
+  // 生成联系页
+  if (options.agentInfo) {
+    const contactSlide = pptx.addSlide();
+    await renderContactPage(contactSlide, options.agentInfo, template);
+  }
+
+  return await pptx.write({ outputType: 'nodebuffer' });
+}
+```
+
+---
+
+## 九、IP形象系统
+
+### 9.1 IP数据结构
+
+```typescript
+interface AgentProfile {
+  id: string;
+  userId: string;
+
+  // 基础信息
+  name: string;
+  nickname?: string;
+  avatar: string;
+  coverImage?: string;
+
+  // 专业信息
+  yearsOfExperience: number;
+  specializedAreas: string[];      // 擅长区域
+  specializedTypes: string[];      // 擅长户型
+  totalDeals: number;              // 成交套数
+  totalClients: number;            // 服务客户数
+
+  // IP风格
+  style: 'professional' | 'friendly' | 'expert' | 'energetic';
+  slogan: string;
+  introduction: string;
+
+  // 统一元素
+  signature: string;               // 签名档
+  openingLine: string;             // 开场白
+  closingLine: string;             // 结束语
+  watermark: WatermarkConfig;
+
+  // 联系方式
+  phone: string;
+  wechat?: string;
+  qrCode?: string;
+
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface WatermarkConfig {
+  enabled: boolean;
+  position: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+  opacity: number;
+  includeAvatar: boolean;
+  includeName: boolean;
+  includePhone: boolean;
+}
+```
+
+### 9.2 内容风格统一
+
+```typescript
+// 自动添加签名
+function applySignature(content: string, profile: AgentProfile): string {
+  return `${content}\n\n${profile.signature}`;
+}
+
+// 生成带水印的图片
+async function addWatermark(
+  imageBuffer: Buffer,
+  profile: AgentProfile
+): Promise<Buffer> {
+  const { watermark } = profile;
+  if (!watermark.enabled) return imageBuffer;
+
+  // 使用 sharp 添加水印
+  const watermarkImage = await generateWatermarkImage(profile, watermark);
+  return await sharp(imageBuffer)
+    .composite([{
+      input: watermarkImage,
+      gravity: watermark.position.replace('-', '')
+    }])
+    .toBuffer();
+}
+```
+
+### 9.3 成交海报生成
+
+```typescript
+interface PosterRequest {
+  type: 'deal' | 'monthly' | 'testimonial';
+  data: DealPosterData | MonthlyPosterData | TestimonialPosterData;
+  templateId?: string;
+}
+
+interface DealPosterData {
+  clientName: string;
+  projectName: string;
+  houseType: string;
+  dealDate: Date;
+  agentProfile: AgentProfile;
+}
+
+// 使用 canvas 生成海报
+async function generatePoster(request: PosterRequest): Promise<Buffer> {
+  const canvas = createCanvas(1080, 1920);
+  const ctx = canvas.getContext('2d');
+
+  // 加载模板背景
+  const template = await loadTemplate(request.templateId);
+  ctx.drawImage(template.background, 0, 0);
+
+  // 渲染内容
+  switch (request.type) {
+    case 'deal':
+      await renderDealPoster(ctx, request.data as DealPosterData);
+      break;
+    case 'monthly':
+      await renderMonthlyPoster(ctx, request.data as MonthlyPosterData);
+      break;
+    case 'testimonial':
+      await renderTestimonialPoster(ctx, request.data as TestimonialPosterData);
+      break;
+  }
+
+  return canvas.toBuffer('image/png');
+}
+```
+```
