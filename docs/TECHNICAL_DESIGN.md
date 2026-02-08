@@ -2770,3 +2770,653 @@ Response: TourSummary
 GET /api/tours?customerId={id}&status=completed&page=1
 Response: { tours: TourPlan[]; total: number }
 ```
+
+---
+
+## 十六、认证授权系统
+
+### 16.1 认证流程
+
+```
+┌──────────┐    ┌──────────────┐    ┌──────────────┐
+│  用户登录  │───▶│  验证手机号   │───▶│  发送验证码   │
+└──────────┘    └──────────────┘    └──────┬───────┘
+                                          │
+                                          ▼
+┌──────────┐    ┌──────────────┐    ┌──────────────┐
+│  返回Token│◀──│  生成JWT     │◀──│  验证码校验   │
+└──────────┘    └──────────────┘    └──────────────┘
+```
+
+### 16.2 JWT Token管理
+
+```typescript
+interface JWTPayload {
+  userId: string;
+  role: 'agent' | 'team_leader' | 'admin';
+  teamId?: string;
+  iat: number;
+  exp: number;
+}
+
+// Token配置
+const tokenConfig = {
+  accessToken: {
+    secret: process.env.JWT_SECRET,
+    expiresIn: '2h',
+  },
+  refreshToken: {
+    secret: process.env.JWT_REFRESH_SECRET,
+    expiresIn: '7d',
+  }
+};
+
+// 生成Token对
+function generateTokenPair(user: User): TokenPair {
+  const payload: JWTPayload = {
+    userId: user.id,
+    role: user.role,
+    teamId: user.teamId,
+    iat: Math.floor(Date.now() / 1000),
+    exp: 0, // 由jwt.sign设置
+  };
+
+  return {
+    accessToken: jwt.sign(payload, tokenConfig.accessToken.secret,
+      { expiresIn: tokenConfig.accessToken.expiresIn }),
+    refreshToken: jwt.sign(payload, tokenConfig.refreshToken.secret,
+      { expiresIn: tokenConfig.refreshToken.expiresIn }),
+  };
+}
+```
+
+### 16.3 RBAC权限控制
+
+```typescript
+type Role = 'agent' | 'team_leader' | 'admin';
+
+const permissions: Record<Role, string[]> = {
+  agent: [
+    'project:read', 'project:create', 'project:update',
+    'material:read', 'material:upload',
+    'content:generate', 'content:read',
+    'customer:read', 'customer:create', 'customer:update',
+    'tour:read', 'tour:create', 'tour:update',
+    'profile:read', 'profile:update',
+    'calculator:use', 'query:use',
+  ],
+  team_leader: [
+    // 继承agent所有权限
+    'team:read', 'team:manage',
+    'agent:read',                    // 查看团队成员数据
+    'report:team',                   // 团队报表
+  ],
+  admin: [
+    // 继承所有权限
+    'user:manage', 'system:config',
+    'report:all',
+  ],
+};
+
+// 权限中间件
+function requirePermission(permission: string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const user = req.user as JWTPayload;
+    const rolePerms = getAllPermissions(user.role);
+    if (!rolePerms.includes(permission)) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+    next();
+  };
+}
+```
+
+### 16.4 数据隔离
+
+```typescript
+// 经纪人只能访问自己的数据
+function scopeToAgent(query: any, userId: string): any {
+  return { ...query, where: { ...query.where, agentId: userId } };
+}
+
+// 团队长可以访问团队数据
+function scopeToTeam(query: any, teamId: string): any {
+  return { ...query, where: { ...query.where, agent: { teamId } } };
+}
+```
+
+### 16.5 API接口
+
+```typescript
+// 发送验证码
+POST /api/auth/sms-code
+Body: { phone: string }
+
+// 验证码登录
+POST /api/auth/login
+Body: { phone: string; code: string }
+Response: { accessToken: string; refreshToken: string; user: User }
+
+// 刷新Token
+POST /api/auth/refresh
+Body: { refreshToken: string }
+Response: { accessToken: string; refreshToken: string }
+
+// 退出登录
+POST /api/auth/logout
+```
+
+---
+
+## 十七、错误处理策略
+
+### 17.1 错误分类
+
+```typescript
+enum ErrorCode {
+  // 客户端错误 4xx
+  BAD_REQUEST = 'BAD_REQUEST',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  FORBIDDEN = 'FORBIDDEN',
+  NOT_FOUND = 'NOT_FOUND',
+  RATE_LIMITED = 'RATE_LIMITED',
+  VALIDATION_ERROR = 'VALIDATION_ERROR',
+
+  // AI服务错误 5xx
+  AI_SERVICE_UNAVAILABLE = 'AI_SERVICE_UNAVAILABLE',
+  AI_GENERATION_FAILED = 'AI_GENERATION_FAILED',
+  AI_CONTENT_FILTERED = 'AI_CONTENT_FILTERED',
+  AI_QUOTA_EXCEEDED = 'AI_QUOTA_EXCEEDED',
+
+  // 外部服务错误
+  SMS_SEND_FAILED = 'SMS_SEND_FAILED',
+  FILE_UPLOAD_FAILED = 'FILE_UPLOAD_FAILED',
+  CHANNEL_API_ERROR = 'CHANNEL_API_ERROR',
+
+  // 系统错误
+  INTERNAL_ERROR = 'INTERNAL_ERROR',
+  DATABASE_ERROR = 'DATABASE_ERROR',
+}
+
+interface ApiError {
+  code: ErrorCode;
+  message: string;              // 用户可见的错误信息
+  detail?: string;              // 开发调试信息（仅开发环境）
+  requestId: string;            // 请求追踪ID
+}
+```
+
+### 17.2 AI服务降级策略
+
+```typescript
+interface FallbackChain {
+  primary: string;              // 主模型
+  fallbacks: string[];          // 降级模型列表
+  maxRetries: number;
+  retryDelay: number;           // 毫秒
+}
+
+const aiServiceFallback: FallbackChain = {
+  primary: 'claude-sonnet-4-20250514',
+  fallbacks: ['gpt-4o', 'deepseek-chat'],
+  maxRetries: 2,
+  retryDelay: 1000,
+};
+
+async function callWithFallback<T>(
+  fn: (model: string) => Promise<T>,
+  chain: FallbackChain
+): Promise<T> {
+  const models = [chain.primary, ...chain.fallbacks];
+
+  for (let i = 0; i < models.length; i++) {
+    for (let retry = 0; retry <= chain.maxRetries; retry++) {
+      try {
+        return await fn(models[i]);
+      } catch (error) {
+        const isLastModel = i === models.length - 1;
+        const isLastRetry = retry === chain.maxRetries;
+
+        if (isLastModel && isLastRetry) throw error;
+        if (isLastRetry) break; // 切换下一个模型
+
+        await sleep(chain.retryDelay * (retry + 1));
+      }
+    }
+  }
+  throw new Error('AI_SERVICE_UNAVAILABLE');
+}
+```
+
+### 17.3 全局错误处理中间件
+
+```typescript
+function errorHandler(err: Error, req: Request, res: Response, next: NextFunction) {
+  const requestId = req.headers['x-request-id'] || generateId();
+
+  // 记录错误日志
+  logger.error({
+    requestId,
+    method: req.method,
+    path: req.path,
+    error: err.message,
+    stack: err.stack,
+    userId: req.user?.userId,
+  });
+
+  // 已知业务错误
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json({
+      code: err.code,
+      message: err.message,
+      requestId,
+    });
+  }
+
+  // 未知错误
+  res.status(500).json({
+    code: ErrorCode.INTERNAL_ERROR,
+    message: '服务暂时不可用，请稍后重试',
+    requestId,
+  });
+}
+
+---
+
+## 十八、限流与缓存策略
+
+### 18.1 API限流
+
+```typescript
+interface RateLimitConfig {
+  windowMs: number;             // 时间窗口（毫秒）
+  maxRequests: number;          // 最大请求数
+  keyGenerator: (req: Request) => string;
+}
+
+const rateLimits: Record<string, RateLimitConfig> = {
+  // 通用API限流
+  general: {
+    windowMs: 60 * 1000,        // 1分钟
+    maxRequests: 60,
+    keyGenerator: (req) => req.user?.userId || req.ip,
+  },
+  // 内容生成限流（消耗AI资源）
+  contentGeneration: {
+    windowMs: 60 * 1000,
+    maxRequests: 10,
+    keyGenerator: (req) => req.user?.userId,
+  },
+  // 验证码限流
+  smsCode: {
+    windowMs: 60 * 1000,
+    maxRequests: 1,
+    keyGenerator: (req) => req.body.phone,
+  },
+};
+
+// 基于Redis的滑动窗口限流
+async function checkRateLimit(
+  key: string,
+  config: RateLimitConfig
+): Promise<{ allowed: boolean; remaining: number; resetAt: number }> {
+  const now = Date.now();
+  const windowStart = now - config.windowMs;
+
+  // 移除过期记录，添加当前请求，统计窗口内请求数
+  const pipeline = redis.pipeline();
+  pipeline.zremrangebyscore(key, 0, windowStart);
+  pipeline.zadd(key, now, `${now}`);
+  pipeline.zcard(key);
+  pipeline.expire(key, Math.ceil(config.windowMs / 1000));
+
+  const results = await pipeline.exec();
+  const count = results[2][1] as number;
+
+  return {
+    allowed: count <= config.maxRequests,
+    remaining: Math.max(0, config.maxRequests - count),
+    resetAt: now + config.windowMs,
+  };
+}
+```
+
+### 18.2 AI配额管理
+
+```typescript
+interface QuotaPlan {
+  plan: 'free' | 'basic' | 'pro' | 'enterprise';
+  daily: {
+    contentGeneration: number;  // 内容生成次数
+    queryCount: number;         // 查询次数
+    matchCount: number;         // 匹配次数
+  };
+  monthly: {
+    totalTokens: number;        // 总Token数
+    pptGeneration: number;      // PPT生成次数
+    posterGeneration: number;   // 海报生成次数
+  };
+}
+
+const quotaPlans: Record<string, QuotaPlan> = {
+  free:       { plan: 'free',       daily: { contentGeneration: 5,   queryCount: 20,  matchCount: 5  }, monthly: { totalTokens: 100000,    pptGeneration: 2,   posterGeneration: 5  } },
+  basic:      { plan: 'basic',      daily: { contentGeneration: 30,  queryCount: 100, matchCount: 20 }, monthly: { totalTokens: 1000000,   pptGeneration: 20,  posterGeneration: 50 } },
+  pro:        { plan: 'pro',        daily: { contentGeneration: 100, queryCount: 500, matchCount: 50 }, monthly: { totalTokens: 5000000,   pptGeneration: 100, posterGeneration: 200 } },
+  enterprise: { plan: 'enterprise', daily: { contentGeneration: -1,  queryCount: -1,  matchCount: -1 }, monthly: { totalTokens: -1,        pptGeneration: -1,  posterGeneration: -1 } },
+};
+
+// 配额检查
+async function checkQuota(
+  userId: string,
+  action: string
+): Promise<boolean> {
+  const user = await db.users.findUnique({ where: { id: userId } });
+  const plan = quotaPlans[user.plan];
+  const usage = await getUsage(userId, action);
+
+  const limit = plan.daily[action] ?? plan.monthly[action];
+  if (limit === -1) return true; // 无限制
+  return usage < limit;
+}
+```
+
+### 18.3 缓存策略
+
+```typescript
+interface CacheConfig {
+  key: string;
+  ttl: number;                  // 秒
+  staleWhileRevalidate?: number; // 过期后仍可使用的时间
+}
+
+const cacheConfigs: Record<string, CacheConfig> = {
+  // 楼盘基础信息（变化少，长缓存）
+  projectInfo:      { key: 'project:{id}',           ttl: 3600,  staleWhileRevalidate: 600 },
+  // 户型信息
+  houseTypes:       { key: 'project:{id}:types',     ttl: 3600 },
+  // 楼盘匹配结果（个性化，短缓存）
+  matchResults:     { key: 'match:{customerId}',     ttl: 300 },
+  // LPR利率（每月更新）
+  lprRate:          { key: 'lpr:current',             ttl: 86400 },
+  // 用户配额使用量
+  dailyUsage:       { key: 'usage:{userId}:{date}',  ttl: 86400 },
+  // 快捷回复模板
+  quickReplies:     { key: 'replies:{agentId}',      ttl: 1800 },
+};
+
+// 缓存读取（支持stale-while-revalidate）
+async function cacheGet<T>(
+  config: CacheConfig,
+  params: Record<string, string>,
+  fetcher: () => Promise<T>
+): Promise<T> {
+  const key = interpolateKey(config.key, params);
+  const cached = await redis.get(key);
+
+  if (cached) return JSON.parse(cached);
+
+  const data = await fetcher();
+  await redis.setex(key, config.ttl, JSON.stringify(data));
+  return data;
+}
+
+// 缓存失效
+async function cacheInvalidate(pattern: string): Promise<void> {
+  const keys = await redis.keys(pattern);
+  if (keys.length > 0) await redis.del(...keys);
+}
+```
+
+---
+
+## 十九、完整数据库Schema
+
+PRD中已定义 projects、house_types、materials、customers、generated_contents 五张表。以下补充缺失的表定义。
+
+### 19.1 用户表 (users)
+
+```sql
+CREATE TABLE users (
+  id TEXT PRIMARY KEY,
+  phone TEXT UNIQUE NOT NULL,
+  name TEXT,
+  avatar TEXT,
+  role TEXT DEFAULT 'agent',       -- agent/team_leader/admin
+  team_id TEXT,
+  plan TEXT DEFAULT 'free',        -- free/basic/pro/enterprise
+  plan_expires_at DATETIME,
+  last_login_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_users_phone ON users(phone);
+CREATE INDEX idx_users_team ON users(team_id);
+```
+
+### 19.2 跟进记录表 (follow_up_records)
+
+```sql
+CREATE TABLE follow_up_records (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  type TEXT NOT NULL,               -- call/wechat/tour/meeting/other
+  content TEXT,
+  result TEXT,
+  next_action TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customers(id),
+  FOREIGN KEY (agent_id) REFERENCES users(id)
+);
+CREATE INDEX idx_followup_customer ON follow_up_records(customer_id);
+CREATE INDEX idx_followup_agent_date ON follow_up_records(agent_id, created_at);
+```
+
+### 19.3 经纪人IP表 (agent_profiles)
+
+```sql
+CREATE TABLE agent_profiles (
+  id TEXT PRIMARY KEY,
+  user_id TEXT UNIQUE NOT NULL,
+  nickname TEXT,
+  cover_image TEXT,
+  years_of_experience INTEGER DEFAULT 0,
+  specialized_areas TEXT,           -- JSON数组
+  specialized_types TEXT,           -- JSON数组
+  total_deals INTEGER DEFAULT 0,
+  total_clients INTEGER DEFAULT 0,
+  style TEXT DEFAULT 'professional',
+  slogan TEXT,
+  introduction TEXT,
+  signature TEXT,
+  opening_line TEXT,
+  closing_line TEXT,
+  watermark_config TEXT,            -- JSON
+  qr_code TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+```
+
+### 19.4 带看计划表 (tour_plans)
+
+```sql
+CREATE TABLE tour_plans (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  scheduled_at DATETIME,
+  status TEXT DEFAULT 'planned',    -- planned/in_progress/completed/cancelled
+  projects_config TEXT NOT NULL,    -- JSON: [{projectId, order, houseTypeIds, duration}]
+  preparation TEXT,                 -- JSON: TourPreparation
+  summary TEXT,                     -- JSON: TourSummary
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (agent_id) REFERENCES users(id),
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+CREATE INDEX idx_tour_agent_date ON tour_plans(agent_id, scheduled_at);
+CREATE INDEX idx_tour_customer ON tour_plans(customer_id);
+```
+
+### 19.5 讲房话术表 (tour_scripts)
+
+```sql
+CREATE TABLE tour_scripts (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  scene TEXT NOT NULL,              -- sandbox/showroom/garden/surrounding
+  house_type_id TEXT,
+  duration TEXT,                    -- short/standard/detailed
+  sections TEXT NOT NULL,           -- JSON: 话术分段内容
+  total_duration TEXT,
+  agent_id TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id),
+  FOREIGN KEY (agent_id) REFERENCES users(id)
+);
+CREATE INDEX idx_script_project ON tour_scripts(project_id);
+```
+
+### 19.6 PPT任务表 (ppt_tasks)
+
+```sql
+CREATE TABLE ppt_tasks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  template_id TEXT,
+  options TEXT NOT NULL,            -- JSON: 生成选项
+  status TEXT DEFAULT 'processing', -- processing/completed/failed
+  progress INTEGER DEFAULT 0,
+  result_pptx_url TEXT,
+  result_pdf_url TEXT,
+  preview_images TEXT,              -- JSON数组
+  error_message TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  completed_at DATETIME,
+  FOREIGN KEY (project_id) REFERENCES projects(id),
+  FOREIGN KEY (agent_id) REFERENCES users(id)
+);
+CREATE INDEX idx_ppt_agent ON ppt_tasks(agent_id);
+```
+
+### 19.7 海报表 (posters)
+
+```sql
+CREATE TABLE posters (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  type TEXT NOT NULL,               -- deal/monthly/testimonial
+  data TEXT NOT NULL,               -- JSON: 海报数据
+  template_id TEXT,
+  image_url TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (agent_id) REFERENCES users(id)
+);
+CREATE INDEX idx_poster_agent ON posters(agent_id);
+```
+
+### 19.8 会话表 (conversations)
+
+```sql
+CREATE TABLE conversations (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  channel TEXT NOT NULL,            -- wechat/wecom/douyin/xiaohongshu/sms
+  customer_id TEXT,
+  external_user_id TEXT,            -- 渠道内用户ID
+  external_user_name TEXT,
+  last_message_at DATETIME,
+  unread_count INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'active',     -- active/archived
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (agent_id) REFERENCES users(id),
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+CREATE INDEX idx_conv_agent_channel ON conversations(agent_id, channel);
+CREATE INDEX idx_conv_last_msg ON conversations(last_message_at DESC);
+```
+
+### 19.9 消息表 (messages)
+
+```sql
+CREATE TABLE messages (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  direction TEXT NOT NULL,          -- inbound/outbound
+  sender_id TEXT,
+  content_type TEXT NOT NULL,       -- text/image/voice/video/link
+  content_text TEXT,
+  content_media_url TEXT,
+  content_metadata TEXT,            -- JSON
+  status TEXT DEFAULT 'received',   -- received/read/replied/archived
+  is_important BOOLEAN DEFAULT FALSE,
+  reply_to_id TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+);
+CREATE INDEX idx_msg_conv_date ON messages(conversation_id, created_at);
+```
+
+### 19.10 快捷回复表 (quick_replies)
+
+```sql
+CREATE TABLE quick_replies (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  category TEXT NOT NULL,           -- greeting/quote/tour/followup
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  variables TEXT,                   -- JSON数组
+  usage_count INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (agent_id) REFERENCES users(id)
+);
+CREATE INDEX idx_reply_agent_cat ON quick_replies(agent_id, category);
+```
+
+### 19.11 提醒表 (reminders)
+
+```sql
+CREATE TABLE reminders (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  type TEXT NOT NULL,               -- follow_up/tour/system
+  message TEXT NOT NULL,
+  priority TEXT DEFAULT 'medium',   -- high/medium/low
+  scheduled_at DATETIME NOT NULL,
+  is_read BOOLEAN DEFAULT FALSE,
+  is_dismissed BOOLEAN DEFAULT FALSE,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (agent_id) REFERENCES users(id),
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+CREATE INDEX idx_reminder_agent_date ON reminders(agent_id, scheduled_at);
+CREATE INDEX idx_reminder_unread ON reminders(agent_id, is_read);
+```
+
+### 19.12 ER关系图
+
+```
+users ──1:N──▶ projects
+users ──1:N──▶ customers
+users ──1:1──▶ agent_profiles
+users ──1:N──▶ tour_plans
+users ──1:N──▶ conversations
+
+projects ──1:N──▶ house_types
+projects ──1:N──▶ materials
+projects ──1:N──▶ generated_contents
+projects ──1:N──▶ tour_scripts
+projects ──1:N──▶ ppt_tasks
+
+customers ──1:N──▶ follow_up_records
+customers ──1:N──▶ tour_plans
+customers ──1:N──▶ conversations
+customers ──1:N──▶ reminders
+
+conversations ──1:N──▶ messages
+```
