@@ -1728,3 +1728,1045 @@ POST /api/customers/parse
 Body: { text: string }
 Response: Partial<Customer>
 ```
+
+---
+
+## 十一、楼盘信息查询系统
+
+### 11.1 查询架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      用户自然语言输入                          │
+│         "XX花园89平的户型怎么样"                               │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      意图识别 (NLU)                           │
+│  - 查询类型分类                                              │
+│  - 实体提取（楼盘名、户型、面积等）                            │
+│  - 参数标准化                                                │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      查询路由                                 │
+│  基础信息 │ 户型查询 │ 价格查询 │ 配套查询 │ 对比查询          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      数据检索 + AI格式化                      │
+│  - 从物料库检索结构化数据                                     │
+│  - AI生成自然语言回答                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 意图识别
+
+```typescript
+type QueryIntent =
+  | 'basic_info'      // 基础信息（位置、开发商、交房时间）
+  | 'house_type'      // 户型查询
+  | 'price'           // 价格查询
+  | 'facilities'      // 配套查询
+  | 'comparison'      // 楼盘对比
+  | 'unknown';
+
+interface QueryParseResult {
+  intent: QueryIntent;
+  entities: {
+    projectNames: string[];     // 楼盘名称
+    houseType?: string;         // 户型
+    area?: number;              // 面积
+    facilityType?: string;      // 配套类型（学校/地铁/商场）
+  };
+  confidence: number;
+}
+
+const intentClassifyPrompt = `
+你是一个房产查询意图分类器。根据用户输入，返回JSON：
+{
+  "intent": "basic_info|house_type|price|facilities|comparison",
+  "entities": {
+    "projectNames": ["楼盘名"],
+    "houseType": "户型（可选）",
+    "area": 面积数字（可选）,
+    "facilityType": "配套类型（可选）"
+  }
+}
+
+用户输入：{query}
+`;
+```
+
+### 11.3 数据检索
+
+```typescript
+async function queryProjectInfo(
+  parsed: QueryParseResult
+): Promise<QueryResponse> {
+  const project = await db.projects.findFirst({
+    where: { name: { contains: parsed.entities.projectNames[0] } },
+    include: { houseTypes: true, facilities: true, materials: true }
+  });
+
+  if (!project) {
+    return { type: 'not_found', suggestion: '要帮你添加这个楼盘吗？' };
+  }
+
+  switch (parsed.intent) {
+    case 'basic_info':
+      return formatBasicInfo(project);
+    case 'house_type':
+      return formatHouseType(project, parsed.entities.area);
+    case 'price':
+      return formatPrice(project, parsed.entities.houseType);
+    case 'facilities':
+      return formatFacilities(project, parsed.entities.facilityType);
+    case 'comparison':
+      const project2 = await db.projects.findFirst({
+        where: { name: { contains: parsed.entities.projectNames[1] } },
+        include: { houseTypes: true, facilities: true }
+      });
+      return formatComparison(project, project2);
+    default:
+      return { type: 'clarify', suggestion: '你想了解哪方面信息？' };
+  }
+}
+```
+
+### 11.4 对比表格生成
+
+```typescript
+interface ComparisonTable {
+  dimensions: string[];
+  projects: {
+    name: string;
+    values: Record<string, string>;
+  }[];
+  summary: string;
+}
+
+function generateComparison(
+  projectA: Project,
+  projectB: Project
+): ComparisonTable {
+  const dimensions = [
+    '位置', '开发商', '主力户型', '单价', '地铁', '学区', '交房时间'
+  ];
+
+  return {
+    dimensions,
+    projects: [
+      { name: projectA.name, values: extractValues(projectA, dimensions) },
+      { name: projectB.name, values: extractValues(projectB, dimensions) },
+    ],
+    summary: '' // 由AI生成总结建议
+  };
+}
+```
+
+### 11.5 API接口
+
+```typescript
+// 自然语言查询
+POST /api/query
+Body: { question: string; context?: string }
+Response: {
+  intent: QueryIntent;
+  answer: string;
+  data?: any;              // 结构化数据
+  suggestions?: string[];  // 追问建议
+}
+
+// 楼盘对比
+POST /api/projects/compare
+Body: { projectIds: string[] }
+Response: ComparisonTable
+```
+
+---
+
+## 十二、智能匹配引擎
+
+### 12.1 匹配架构
+
+```
+┌──────────────┐    ┌──────────────┐
+│   客户需求    │    │   楼盘特征    │
+│  结构化数据   │    │  结构化数据   │
+└──────┬───────┘    └──────┬───────┘
+       │                   │
+       ▼                   ▼
+┌──────────────┐    ┌──────────────┐
+│  需求向量化   │    │  楼盘向量化   │
+│  Embedding   │    │  Embedding   │
+└──────┬───────┘    └──────┬───────┘
+       │                   │
+       └────────┬──────────┘
+                ▼
+       ┌────────────────┐
+       │   多维度匹配    │
+       │  加权相似度计算  │
+       └────────┬───────┘
+                ▼
+       ┌────────────────┐
+       │   排序 + AI解释 │
+       │  生成推荐理由   │
+       └────────────────┘
+```
+
+### 12.2 向量化与索引
+
+```typescript
+// 使用向量数据库存储楼盘特征
+import { ChromaClient } from 'chromadb';
+
+const chroma = new ChromaClient();
+const projectCollection = await chroma.getOrCreateCollection({
+  name: 'project_vectors',
+  metadata: { 'hnsw:space': 'cosine' }
+});
+
+// 楼盘特征向量化
+async function indexProject(project: Project): Promise<void> {
+  const featureText = [
+    `区域:${project.district}`,
+    `单价:${project.unitPrice}万`,
+    `面积:${project.houseTypes.map(h => h.area).join('/')}㎡`,
+    `配套:${project.facilities.map(f => f.name).join(',')}`,
+    `产品:${project.productType}`,
+    `交房:${project.deliveryDate}`,
+  ].join(' ');
+
+  await projectCollection.upsert({
+    ids: [project.id],
+    documents: [featureText],
+    metadatas: [{
+      district: project.district,
+      minPrice: project.minTotalPrice,
+      maxPrice: project.maxTotalPrice,
+      minArea: Math.min(...project.houseTypes.map(h => h.area)),
+      maxArea: Math.max(...project.houseTypes.map(h => h.area)),
+    }]
+  });
+}
+```
+
+### 12.3 多维度匹配算法
+
+```typescript
+interface MatchDimension {
+  name: string;
+  weight: number;
+  scorer: (customer: Customer, project: Project) => number;
+}
+
+const matchDimensions: MatchDimension[] = [
+  {
+    name: '价格匹配',
+    weight: 0.3,
+    scorer: (c, p) => {
+      const budgetCenter = (c.budget.min + c.budget.max) / 2;
+      const priceCenter = (p.minTotalPrice + p.maxTotalPrice) / 2;
+      const diff = Math.abs(budgetCenter - priceCenter) / budgetCenter;
+      return Math.max(0, 1 - diff);
+    }
+  },
+  {
+    name: '区域匹配',
+    weight: 0.25,
+    scorer: (c, p) => c.areas.includes(p.district) ? 1.0 : 0.0
+  },
+  {
+    name: '面积匹配',
+    weight: 0.2,
+    scorer: (c, p) => {
+      const hasMatch = p.houseTypes.some(h =>
+        h.rooms === parseInt(c.houseType) ||
+        (h.area >= c.budget.min * 0.8 && h.area <= c.budget.max * 1.2)
+      );
+      return hasMatch ? 1.0 : 0.3;
+    }
+  },
+  {
+    name: '配套匹配',
+    weight: 0.15,
+    scorer: (c, p) => {
+      const needs = extractFacilityNeeds(c);
+      const has = p.facilities.map(f => f.type);
+      const matched = needs.filter(n => has.includes(n)).length;
+      return needs.length > 0 ? matched / needs.length : 0.5;
+    }
+  },
+  {
+    name: '产品匹配',
+    weight: 0.1,
+    scorer: (c, p) => {
+      const pref = extractProductPreference(c);
+      return pref === p.productType ? 1.0 : 0.5;
+    }
+  }
+];
+
+async function matchProjects(
+  customer: Customer,
+  limit: number = 5
+): Promise<MatchResult[]> {
+  // 第一步：向量粗筛（召回Top 20）
+  const candidates = await projectCollection.query({
+    queryTexts: [buildCustomerQuery(customer)],
+    nResults: 20,
+    where: {
+      minPrice: { $lte: customer.budget.max * 10000 },
+      maxPrice: { $gte: customer.budget.min * 10000 },
+    }
+  });
+
+  // 第二步：多维度精排
+  const projects = await db.projects.findMany({
+    where: { id: { in: candidates.ids[0] } },
+    include: { houseTypes: true, facilities: true }
+  });
+
+  const scored = projects.map(project => {
+    const scores = matchDimensions.map(dim => ({
+      dimension: dim.name,
+      score: dim.scorer(customer, project),
+      weight: dim.weight,
+    }));
+    const totalScore = scores.reduce((sum, s) => sum + s.score * s.weight, 0);
+    return { project, scores, totalScore };
+  });
+
+  // 第三步：排序取Top N
+  scored.sort((a, b) => b.totalScore - a.totalScore);
+  const topResults = scored.slice(0, limit);
+
+  // 第四步：AI生成推荐理由
+  for (const result of topResults) {
+    result.reason = await generateMatchReason(customer, result);
+  }
+
+  return topResults;
+}
+```
+
+### 12.4 推荐理由生成
+
+```typescript
+const matchReasonPrompt = `
+根据客户需求和楼盘信息，生成简洁的推荐理由。
+
+客户需求：{customer_needs}
+楼盘信息：{project_info}
+匹配评分：{scores}
+
+要求：
+1. 2-3句话说明推荐原因
+2. 突出最匹配的维度
+3. 提及需要注意的点
+4. 推荐最适合的户型
+`;
+
+interface MatchResult {
+  project: Project;
+  totalScore: number;
+  scores: { dimension: string; score: number }[];
+  reason?: string;
+  recommendedHouseType?: string;
+}
+```
+
+### 12.5 API接口
+
+```typescript
+// 为客户匹配楼盘
+POST /api/customers/{customerId}/match
+Body: { limit?: number; filters?: Record<string, any> }
+Response: {
+  matches: MatchResult[];
+  totalCandidates: number;
+}
+
+// 获取楼盘推荐（带缓存）
+GET /api/recommendations/{customerId}?refresh=false
+Response: {
+  matches: MatchResult[];
+  generatedAt: string;
+  expiresAt: string;
+}
+```
+
+---
+
+## 十三、费用计算器
+
+### 13.1 计算引擎
+
+```typescript
+// 等额本息月供计算
+function calcEqualInstallment(
+  principal: number,    // 贷款金额（元）
+  annualRate: number,   // 年利率（如4.2表示4.2%）
+  years: number         // 贷款年限
+): MortgageResult {
+  const monthlyRate = annualRate / 100 / 12;
+  const months = years * 12;
+  const monthlyPayment = principal * monthlyRate *
+    Math.pow(1 + monthlyRate, months) /
+    (Math.pow(1 + monthlyRate, months) - 1);
+  const totalPayment = monthlyPayment * months;
+  const totalInterest = totalPayment - principal;
+
+  return {
+    monthlyPayment: Math.round(monthlyPayment),
+    totalPayment: Math.round(totalPayment),
+    totalInterest: Math.round(totalInterest),
+    method: 'equal_installment'
+  };
+}
+
+// 等额本金月供计算
+function calcEqualPrincipal(
+  principal: number,
+  annualRate: number,
+  years: number
+): MortgageResult {
+  const monthlyRate = annualRate / 100 / 12;
+  const months = years * 12;
+  const monthlyPrincipal = principal / months;
+  const firstMonthPayment = monthlyPrincipal + principal * monthlyRate;
+  const lastMonthPayment = monthlyPrincipal + monthlyPrincipal * monthlyRate;
+  const totalInterest = (months + 1) * principal * monthlyRate / 2;
+
+  return {
+    monthlyPayment: Math.round(firstMonthPayment),  // 首月
+    lastMonthPayment: Math.round(lastMonthPayment),  // 末月
+    totalPayment: Math.round(principal + totalInterest),
+    totalInterest: Math.round(totalInterest),
+    method: 'equal_principal'
+  };
+}
+
+interface MortgageResult {
+  monthlyPayment: number;
+  lastMonthPayment?: number;
+  totalPayment: number;
+  totalInterest: number;
+  method: 'equal_installment' | 'equal_principal';
+}
+```
+
+### 13.2 税费计算
+
+```typescript
+interface TaxCalcInput {
+  totalPrice: number;       // 房屋总价（万）
+  area: number;             // 面积（㎡）
+  isFirstHome: boolean;     // 是否首套
+  isOver5Years: boolean;    // 是否满五年（二手房）
+  isUnique: boolean;        // 是否唯一（二手房）
+  isNewHome: boolean;       // 新房/二手房
+}
+
+interface TaxResult {
+  deedTax: number;          // 契税
+  vatTax: number;           // 增值税
+  incomeTax: number;        // 个人所得税
+  agencyFee: number;        // 中介费
+  otherFees: number;        // 其他费用
+  totalFees: number;        // 总费用
+  breakdown: { name: string; amount: number; rate: string }[];
+}
+
+function calcTax(input: TaxCalcInput): TaxResult {
+  const { totalPrice, area, isFirstHome, isOver5Years, isUnique, isNewHome } = input;
+  const priceYuan = totalPrice * 10000;
+
+  // 契税
+  let deedTaxRate: number;
+  if (isFirstHome && area <= 90) deedTaxRate = 0.01;
+  else if (isFirstHome && area > 90) deedTaxRate = 0.015;
+  else deedTaxRate = 0.03;
+  const deedTax = priceYuan * deedTaxRate;
+
+  // 增值税（二手房，满2年免征）
+  const vatTax = (!isNewHome && !isOver5Years)
+    ? priceYuan * 0.053 : 0;
+
+  // 个人所得税（满五唯一免征）
+  const incomeTax = (!isNewHome && !(isOver5Years && isUnique))
+    ? priceYuan * 0.01 : 0;
+
+  // 中介费（二手房）
+  const agencyFee = isNewHome ? 0 : priceYuan * 0.02;
+
+  // 其他费用（权证、评估等）
+  const otherFees = 5000;
+
+  const totalFees = deedTax + vatTax + incomeTax + agencyFee + otherFees;
+
+  return {
+    deedTax, vatTax, incomeTax, agencyFee, otherFees, totalFees,
+    breakdown: [
+      { name: '契税', amount: deedTax, rate: `${deedTaxRate * 100}%` },
+      { name: '增值税', amount: vatTax, rate: vatTax > 0 ? '5.3%' : '免征' },
+      { name: '个税', amount: incomeTax, rate: incomeTax > 0 ? '1%' : '免征' },
+      { name: '中介费', amount: agencyFee, rate: agencyFee > 0 ? '2%' : '无' },
+      { name: '其他', amount: otherFees, rate: '固定' },
+    ]
+  };
+}
+```
+
+### 13.3 首付计算
+
+```typescript
+interface DownPaymentInput {
+  totalPrice: number;           // 房屋总价（万）
+  isFirstHome: boolean;         // 是否首套
+  providentFundBalance?: number; // 公积金余额（万）
+  loanYears?: number;           // 贷款年限
+}
+
+function calcDownPayment(input: DownPaymentInput): DownPaymentResult {
+  const ratio = input.isFirstHome ? 0.3 : 0.5;
+  const downPayment = input.totalPrice * ratio;
+  const loanAmount = input.totalPrice - downPayment;
+  const years = input.loanYears || 30;
+
+  const mortgage = calcEqualInstallment(
+    loanAmount * 10000,
+    getCurrentLPR(),
+    years
+  );
+
+  return {
+    downPaymentRatio: ratio,
+    downPayment,
+    loanAmount,
+    monthlyPayment: mortgage.monthlyPayment,
+    providentFundDeduction: input.providentFundBalance || 0,
+    actualDownPayment: downPayment - (input.providentFundBalance || 0),
+  };
+}
+
+// LPR利率管理
+interface LPRConfig {
+  rate5YearAbove: number;   // 5年期以上LPR
+  rate5YearBelow: number;   // 5年期以下LPR
+  updatedAt: Date;
+}
+
+function getCurrentLPR(): number {
+  // 从配置中获取最新LPR利率
+  return config.get<number>('lpr.rate5YearAbove', 3.95);
+}
+```
+
+### 13.4 自然语言触发
+
+```typescript
+// 从对话中识别计算意图
+const calcIntentPrompt = `
+判断用户是否想进行费用计算，返回JSON：
+{
+  "isCalcRequest": true/false,
+  "calcType": "mortgage|tax|downpayment",
+  "params": {
+    "totalPrice": 数字（万）,
+    "loanAmount": 数字（万）,
+    "years": 数字,
+    "area": 数字（㎡）,
+    "isFirstHome": true/false
+  }
+}
+
+用户输入：{query}
+`;
+```
+
+### 13.5 API接口
+
+```typescript
+// 月供计算
+POST /api/calculator/mortgage
+Body: {
+  loanAmount: number;       // 贷款金额（万）
+  years: number;            // 贷款年限
+  rate?: number;            // 利率（默认LPR）
+  method: 'equal_installment' | 'equal_principal';
+}
+Response: MortgageResult
+
+// 税费计算
+POST /api/calculator/tax
+Body: TaxCalcInput
+Response: TaxResult
+
+// 首付计算
+POST /api/calculator/downpayment
+Body: DownPaymentInput
+Response: DownPaymentResult
+
+// 获取当前LPR利率
+GET /api/calculator/lpr
+Response: LPRConfig
+```
+
+---
+
+## 十四、多渠道消息中心
+
+### 14.1 消息聚合架构
+
+```
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+│  微信     │ │ 企业微信  │ │  抖音    │ │ 小红书    │
+│ Webhook  │ │ Webhook  │ │  API     │ │  API     │
+└────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
+     │            │            │            │
+     └────────────┴─────┬──────┴────────────┘
+                        ▼
+              ┌──────────────────┐
+              │   消息网关        │
+              │  统一格式转换     │
+              │  消息去重/排序    │
+              └────────┬─────────┘
+                       ▼
+              ┌──────────────────┐
+              │   消息队列        │
+              │  Redis Stream    │
+              └────────┬─────────┘
+                       ▼
+              ┌──────────────────┐
+              │   消息处理器      │
+              │  存储/通知/AI分析 │
+              └──────────────────┘
+```
+
+### 14.2 统一消息模型
+
+```typescript
+interface UnifiedMessage {
+  id: string;
+  agentId: string;              // 经纪人ID
+  channel: 'wechat' | 'wecom' | 'douyin' | 'xiaohongshu' | 'sms';
+  direction: 'inbound' | 'outbound';
+
+  // 发送方
+  sender: {
+    id: string;                 // 渠道内用户ID
+    name: string;
+    avatar?: string;
+  };
+
+  // 消息内容
+  content: {
+    type: 'text' | 'image' | 'voice' | 'video' | 'link' | 'location';
+    text?: string;
+    mediaUrl?: string;
+    metadata?: Record<string, any>;
+  };
+
+  // 关联
+  customerId?: string;          // 关联客户ID
+  conversationId: string;       // 会话ID
+  replyToId?: string;           // 回复的消息ID
+
+  // 状态
+  status: 'received' | 'read' | 'replied' | 'archived';
+  isImportant: boolean;
+  createdAt: Date;
+}
+
+interface Conversation {
+  id: string;
+  agentId: string;
+  channel: string;
+  customerId?: string;
+  lastMessageAt: Date;
+  unreadCount: number;
+  messages: UnifiedMessage[];
+}
+```
+
+### 14.3 渠道适配器
+
+```typescript
+interface ChannelAdapter {
+  channel: string;
+  parseInbound(rawData: any): UnifiedMessage;
+  formatOutbound(message: UnifiedMessage): any;
+  sendMessage(to: string, content: any): Promise<boolean>;
+  verifyWebhook(req: Request): boolean;
+}
+
+// 微信适配器
+class WechatAdapter implements ChannelAdapter {
+  channel = 'wechat';
+
+  parseInbound(rawData: WechatMessage): UnifiedMessage {
+    return {
+      id: generateId(),
+      channel: 'wechat',
+      direction: 'inbound',
+      sender: {
+        id: rawData.FromUserName,
+        name: rawData.FromUserName,
+      },
+      content: {
+        type: mapWechatMsgType(rawData.MsgType),
+        text: rawData.Content,
+        mediaUrl: rawData.MediaId ? resolveMediaUrl(rawData.MediaId) : undefined,
+      },
+      conversationId: `wechat_${rawData.FromUserName}`,
+      status: 'received',
+      isImportant: false,
+      createdAt: new Date(rawData.CreateTime * 1000),
+    } as UnifiedMessage;
+  }
+
+  async sendMessage(to: string, content: any): Promise<boolean> {
+    return await wechatApi.sendCustomMessage(to, content);
+  }
+}
+
+// 适配器注册
+const adapters: Record<string, ChannelAdapter> = {
+  wechat: new WechatAdapter(),
+  wecom: new WecomAdapter(),
+  douyin: new DouyinAdapter(),
+  xiaohongshu: new XiaohongshuAdapter(),
+};
+```
+
+### 14.4 智能回复
+
+```typescript
+interface SmartReplyRequest {
+  conversationId: string;
+  inboundMessage: UnifiedMessage;
+  customerProfile?: Customer;
+}
+
+async function generateSmartReply(
+  req: SmartReplyRequest
+): Promise<string[]> {
+  // 获取会话历史
+  const history = await db.messages.findMany({
+    where: { conversationId: req.conversationId },
+    orderBy: { createdAt: 'desc' },
+    take: 10
+  });
+
+  const prompt = `
+你是房产经纪人的AI助手。根据客户消息和会话历史，生成3条候选回复。
+
+客户消息：${req.inboundMessage.content.text}
+会话历史：${formatHistory(history)}
+${req.customerProfile ? `客户信息：${JSON.stringify(req.customerProfile)}` : ''}
+
+要求：
+1. 回复专业、亲切
+2. 第一条最推荐，后两条为备选
+3. 每条不超过100字
+返回JSON数组：["回复1", "回复2", "回复3"]
+`;
+
+  const response = await aiService.generate(prompt);
+  return JSON.parse(response);
+}
+```
+
+### 14.5 快捷回复模板
+
+```typescript
+interface QuickReply {
+  id: string;
+  agentId: string;
+  category: string;           // 分类：问候/报价/约看/跟进
+  title: string;              // 模板标题
+  content: string;            // 模板内容（支持变量）
+  variables?: string[];       // 可替换变量
+  usageCount: number;
+}
+
+// 变量替换
+function renderTemplate(
+  template: string,
+  vars: Record<string, string>
+): string {
+  return template.replace(/\{(\w+)\}/g, (_, key) => vars[key] || `{${key}}`);
+}
+```
+
+### 14.6 API接口
+
+```typescript
+// Webhook接收（各渠道）
+POST /api/webhooks/{channel}
+
+// 获取会话列表
+GET /api/conversations?channel=wechat&status=unread&page=1
+Response: { conversations: Conversation[]; total: number }
+
+// 获取会话消息
+GET /api/conversations/{id}/messages?limit=20&before={messageId}
+Response: { messages: UnifiedMessage[] }
+
+// 发送消息
+POST /api/conversations/{id}/messages
+Body: { content: { type: string; text?: string; mediaUrl?: string } }
+
+// 获取智能回复建议
+POST /api/conversations/{id}/smart-reply
+Response: { suggestions: string[] }
+
+// 快捷回复模板
+GET /api/quick-replies?category=greeting
+POST /api/quick-replies
+Body: QuickReply
+```
+
+---
+
+## 十五、AI带看助手
+
+### 15.1 带看流程架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       带看前                                 │
+│  创建带看计划 → 生成准备清单 → 定制话术 → 规划路线            │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                       带看中                                 │
+│  实时查询 → 竞品对比 → 费用计算 → 异议应对                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                       带看后                                 │
+│  生成总结 → 意向评估 → 跟进建议 → 更新客户档案               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 数据结构
+
+```typescript
+interface TourPlan {
+  id: string;
+  agentId: string;
+  customerId: string;
+  scheduledAt: Date;
+  status: 'planned' | 'in_progress' | 'completed' | 'cancelled';
+
+  // 带看楼盘
+  projects: {
+    projectId: string;
+    order: number;              // 参观顺序
+    houseTypeIds: string[];     // 要看的户型
+    estimatedDuration: number;  // 预计时长（分钟）
+  }[];
+
+  // AI生成内容
+  preparation?: TourPreparation;
+  summary?: TourSummary;
+
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface TourPreparation {
+  customerBrief: string;        // 客户简况
+  focusPoints: string[];        // 客户关注点预测
+  customScripts: {              // 针对性话术
+    projectId: string;
+    script: string;
+    objections: { question: string; answer: string }[];
+  }[];
+  routeSuggestion: string;      // 路线建议
+  timeAllocation: { projectName: string; minutes: number }[];
+}
+
+interface TourSummary {
+  duration: number;             // 实际时长（分钟）
+  projectsFeedback: {
+    projectId: string;
+    projectName: string;
+    interest: 'high' | 'medium' | 'low';
+    feedback: string;           // 客户反馈
+    concerns: string[];         // 客户顾虑
+  }[];
+  overallAssessment: string;    // 整体评估
+  nextSteps: string[];          // 下一步建议
+  followUpDate: Date;           // 建议跟进日期
+  followUpScript: string;       // 跟进话术
+}
+```
+
+### 15.3 带看前准备生成
+
+```typescript
+async function generatePreparation(
+  plan: TourPlan
+): Promise<TourPreparation> {
+  const customer = await db.customers.findUnique({
+    where: { id: plan.customerId }
+  });
+  const projects = await db.projects.findMany({
+    where: { id: { in: plan.projects.map(p => p.projectId) } },
+    include: { houseTypes: true, facilities: true }
+  });
+
+  const prompt = `
+你是资深房产经纪人助手。根据客户信息和待看楼盘，生成带看准备材料。
+
+## 客户信息
+${JSON.stringify(customer)}
+
+## 待看楼盘
+${projects.map(p => JSON.stringify(p)).join('\n')}
+
+## 请生成
+1. 客户简况（50字内）
+2. 客户可能关注的3-5个重点
+3. 每个楼盘的针对性话术（突出与客户需求匹配的卖点）
+4. 每个楼盘可能遇到的异议及应对
+5. 参观路线建议和时间分配
+
+返回JSON格式。
+`;
+
+  const result = await aiService.generate(prompt);
+  return JSON.parse(result);
+}
+```
+
+### 15.4 带看中实时查询
+
+```typescript
+interface TourQuery {
+  tourId: string;
+  question: string;
+  context?: {
+    currentProjectId?: string;
+    currentHouseTypeId?: string;
+  };
+}
+
+async function handleTourQuery(query: TourQuery): Promise<string> {
+  const tour = await db.tourPlans.findUnique({
+    where: { id: query.tourId },
+    include: { customer: true }
+  });
+
+  // 识别查询类型并路由
+  const intent = await classifyTourQueryIntent(query.question);
+
+  switch (intent) {
+    case 'property_info':
+      return await queryProjectInfo(parseQuery(query.question));
+    case 'comparison':
+      return await generateComparison(query.context);
+    case 'calculation':
+      return await handleCalculation(query.question);
+    case 'objection':
+      return await generateObjectionResponse(
+        query.question, query.context?.currentProjectId
+      );
+    default:
+      return await aiService.generate(
+        `回答经纪人在带看过程中的问题：${query.question}`
+      );
+  }
+}
+```
+
+### 15.5 带看后总结生成
+
+```typescript
+async function generateTourSummary(
+  tourId: string,
+  feedbackInput: {
+    projectId: string;
+    interest: 'high' | 'medium' | 'low';
+    notes: string;
+  }[]
+): Promise<TourSummary> {
+  const tour = await db.tourPlans.findUnique({
+    where: { id: tourId },
+    include: { customer: true }
+  });
+
+  const prompt = `
+根据带看情况生成总结报告和跟进建议。
+
+客户：${tour.customer.name}
+看房反馈：
+${feedbackInput.map(f => `- ${f.projectId}: 意向${f.interest}, ${f.notes}`).join('\n')}
+
+请生成：
+1. 每个楼盘的客户反馈总结和顾虑点
+2. 整体意向评估
+3. 具体的下一步行动建议（3-5条）
+4. 建议跟进日期
+5. 跟进话术（100字内）
+
+返回JSON格式。
+`;
+
+  const summary = JSON.parse(await aiService.generate(prompt));
+
+  // 自动更新客户状态
+  await db.customers.update({
+    where: { id: tour.customerId },
+    data: {
+      status: 'toured',
+      lastContactAt: new Date(),
+      nextFollowUpAt: summary.followUpDate,
+    }
+  });
+
+  return summary;
+}
+```
+
+### 15.6 API接口
+
+```typescript
+// 创建带看计划
+POST /api/tours
+Body: {
+  customerId: string;
+  scheduledAt: string;
+  projects: { projectId: string; houseTypeIds: string[] }[];
+}
+Response: TourPlan
+
+// 生成带看准备
+POST /api/tours/{tourId}/prepare
+Response: TourPreparation
+
+// 带看中实时查询
+POST /api/tours/{tourId}/query
+Body: { question: string; context?: any }
+Response: { answer: string }
+
+// 提交带看反馈并生成总结
+POST /api/tours/{tourId}/summary
+Body: {
+  feedback: { projectId: string; interest: string; notes: string }[];
+}
+Response: TourSummary
+
+// 获取带看历史
+GET /api/tours?customerId={id}&status=completed&page=1
+Response: { tours: TourPlan[]; total: number }
+```
