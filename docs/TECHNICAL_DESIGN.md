@@ -1545,4 +1545,186 @@ async function generatePoster(request: PosterRequest): Promise<Buffer> {
   return canvas.toBuffer('image/png');
 }
 ```
+
+### 9.4 API接口
+
+```typescript
+// 获取经纪人IP信息
+GET /api/agent-profile
+Response: AgentProfile
+
+// 更新经纪人IP信息
+PUT /api/agent-profile
+Body: Partial<AgentProfile>
+
+// 生成海报
+POST /api/posters
+Body: PosterRequest
+Response: { taskId: string; status: 'processing' }
+
+// 获取海报生成结果
+GET /api/posters/{taskId}
+Response: { status: string; imageUrl?: string }
+
+// 添加水印
+POST /api/watermark
+Body: { imageUrl: string }
+Response: { imageUrl: string }
+```
+
+---
+
+## 十、客户管理系统
+
+### 10.1 数据结构
+
+```typescript
+interface Customer {
+  id: string;
+  agentId: string;              // 所属经纪人
+
+  // 基本信息
+  name: string;                 // 称呼
+  phone?: string;
+  wechat?: string;
+
+  // 需求信息
+  budget: { min: number; max: number };  // 预算范围（万）
+  areas: string[];              // 意向区域
+  houseType: string;            // 户型需求
+  purpose: 'self' | 'invest' | 'education' | 'retirement';
+
+  // 标签
+  autoTags: string[];           // 系统自动标签
+  manualTags: string[];         // 手动标签
+
+  // 状态
+  status: 'new' | 'contacted' | 'toured' | 'negotiating' | 'closed' | 'paused';
+  lastContactAt: Date;
+  nextFollowUpAt?: Date;
+
+  // 记录
+  notes: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface FollowUpRecord {
+  id: string;
+  customerId: string;
+  type: 'call' | 'wechat' | 'tour' | 'meeting' | 'other';
+  content: string;
+  result?: string;
+  nextAction?: string;
+  createdAt: Date;
+}
+```
+
+### 10.2 智能标签引擎
+
+```typescript
+// 根据客户信息自动生成标签
+function generateAutoTags(customer: Customer): string[] {
+  const tags: string[] = [];
+
+  // 预算标签
+  if (customer.budget.max <= 200) tags.push('刚需');
+  else if (customer.budget.max <= 500) tags.push('改善');
+  else tags.push('高端');
+
+  // 区域标签
+  customer.areas.forEach(area => {
+    tags.push(`${area}客`);
+  });
+
+  // 目的标签
+  const purposeMap = {
+    self: '自住', invest: '投资',
+    education: '学区', retirement: '养老'
+  };
+  tags.push(purposeMap[customer.purpose]);
+
+  return tags;
+}
+```
+
+### 10.3 跟进提醒调度
+
+```typescript
+interface FollowUpRule {
+  status: Customer['status'];
+  idleDays: number;             // 未跟进天数阈值
+  reminderTemplate: string;     // 提醒话术模板
+  priority: 'high' | 'medium' | 'low';
+}
+
+const followUpRules: FollowUpRule[] = [
+  { status: 'new', idleDays: 1, reminderTemplate: '{name}还没跟进，发条消息问问需求？', priority: 'high' },
+  { status: 'contacted', idleDays: 3, reminderTemplate: '{name}{days}天没联系了，约个时间带看？', priority: 'medium' },
+  { status: 'toured', idleDays: 2, reminderTemplate: '{name}看房后{days}天了，问问考虑得怎么样？', priority: 'high' },
+  { status: 'negotiating', idleDays: 1, reminderTemplate: '{name}在考虑中，今天跟进一下？', priority: 'high' },
+  { status: 'paused', idleDays: 7, reminderTemplate: '{name}搁置一周了，要不要激活？', priority: 'low' },
+];
+
+// 每日定时任务：扫描需要跟进的客户
+async function scanFollowUps(agentId: string): Promise<FollowUpReminder[]> {
+  const customers = await db.customers.findMany({
+    where: { agentId, status: { not: 'closed' } }
+  });
+
+  const reminders: FollowUpReminder[] = [];
+  const now = new Date();
+
+  for (const customer of customers) {
+    const rule = followUpRules.find(r => r.status === customer.status);
+    if (!rule) continue;
+
+    const idleDays = diffDays(now, customer.lastContactAt);
+    if (idleDays >= rule.idleDays) {
+      reminders.push({
+        customerId: customer.id,
+        customerName: customer.name,
+        message: rule.reminderTemplate
+          .replace('{name}', customer.name)
+          .replace('{days}', String(idleDays)),
+        priority: rule.priority,
+      });
+    }
+  }
+
+  return reminders.sort((a, b) =>
+    priorityOrder[a.priority] - priorityOrder[b.priority]
+  );
+}
+```
+
+### 10.4 API接口
+
+```typescript
+// 创建客户（支持自然语言录入）
+POST /api/customers
+Body: {
+  mode: 'form' | 'natural_language';
+  data?: Partial<Customer>;       // form模式
+  text?: string;                  // 自然语言模式
+}
+
+// 客户列表
+GET /api/customers?status=new&tag=刚需&page=1&limit=20
+
+// 更新客户状态
+PATCH /api/customers/{id}
+Body: Partial<Customer>
+
+// 添加跟进记录
+POST /api/customers/{id}/follow-ups
+Body: { type: string; content: string; nextAction?: string }
+
+// 获取今日待跟进
+GET /api/follow-up-reminders
+
+// AI解析自然语言录入
+POST /api/customers/parse
+Body: { text: string }
+Response: Partial<Customer>
 ```

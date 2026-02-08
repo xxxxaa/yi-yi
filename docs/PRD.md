@@ -964,7 +964,7 @@ CREATE TABLE generated_contents (
 | 带看 | 带客户实地看房 |
 | 种草 | 通过内容引发购买兴趣 |
 
-### 14.3 相关文档
+### 14.2 相关文档
 
 - [用户研究文档](./USER_RESEARCH.md) - 详细的用户画像和场景分析
 - [功能规格说明](./FEATURE_SPEC.md) - 各功能的详细交互设计
