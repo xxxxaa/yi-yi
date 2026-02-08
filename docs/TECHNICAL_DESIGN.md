@@ -801,6 +801,14 @@ type ModelApi =
   | 'openai-completions'      // OpenAI 兼容
   | 'anthropic-messages'      // Anthropic 原生
   | 'google-generative-ai';   // Google AI
+
+interface ModelDefinition {
+  id: string;                   // 模型ID
+  name: string;                 // 显示名称
+  contextWindow: number;        // 上下文窗口大小
+  maxOutputTokens: number;      // 最大输出Token数
+  capabilities: ('text' | 'vision' | 'function_calling')[];
+}
 ```
 
 #### 配置文件示例
