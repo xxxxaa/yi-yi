@@ -8,12 +8,13 @@
     "yiyi": "dist/cli/entry.mjs"
   },
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && pnpm --filter yiyi-web build",
     "dev": "tsx src/cli/entry.ts",
     "dev:gateway": "tsx src/gateway/server.ts",
+    "dev:web": "pnpm --filter yiyi-web dev",
     "lint": "oxlint",
     "format": "oxfmt --check src/",
-    "test": "vitest run",
+    "test": "vitest run --config vitest.config.ts",
     "check": "tsc --noEmit && pnpm lint && pnpm format"
   },
   "engines": {
@@ -21,8 +22,10 @@
   },
   "packageManager": "pnpm@10.23.0",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.74.0",
     "commander": "^13.1.0",
     "json5": "^2.2.3",
+    "openai": "^6.18.0",
     "tslog": "^4.9.3",
     "ws": "^8.18.0",
     "zod": "^3.24.0"
@@ -37,5 +40,10 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^3.1.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }
