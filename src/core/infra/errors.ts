@@ -38,3 +38,15 @@ export function formatUncaughtError(err: unknown): string {
   }
   return formatErrorMessage(err);
 }
+
+export interface ErrorPayload {
+  code: string;
+  message: string;
+}
+
+export function toErrorPayload(err: unknown): ErrorPayload {
+  return {
+    code: extractErrorCode(err) ?? "INTERNAL",
+    message: formatErrorMessage(err),
+  };
+}

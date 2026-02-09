@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { extractErrorCode, formatErrorMessage, formatUncaughtError } from "./errors.ts";
+import {
+  extractErrorCode,
+  formatErrorMessage,
+  formatUncaughtError,
+  toErrorPayload,
+} from "./errors.ts";
 
 describe("extractErrorCode", () => {
   it("returns string code from error-like object", () => {
@@ -50,5 +55,22 @@ describe("formatUncaughtError", () => {
     const err = new Error("fail");
     expect(formatUncaughtError(err)).toContain("fail");
     expect(formatUncaughtError(err)).toContain("Error");
+  });
+});
+
+describe("toErrorPayload", () => {
+  it("extracts code and message from coded error", () => {
+    const err = Object.assign(new Error("not found"), { code: "NOT_FOUND" });
+    expect(toErrorPayload(err)).toEqual({ code: "NOT_FOUND", message: "not found" });
+  });
+
+  it("defaults code to INTERNAL for plain errors", () => {
+    const result = toErrorPayload(new Error("oops"));
+    expect(result.code).toBe("INTERNAL");
+    expect(result.message).toBe("oops");
+  });
+
+  it("handles non-Error values", () => {
+    expect(toErrorPayload("string error")).toEqual({ code: "INTERNAL", message: "string error" });
   });
 });
