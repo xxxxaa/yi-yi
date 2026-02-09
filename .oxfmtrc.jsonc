@@ -1,0 +1,7 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  // Sort imports without blank lines between groups
+  "experimentalSortImports": {
+    "newlinesBetween": false
+  }
+}

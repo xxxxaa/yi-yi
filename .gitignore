@@ -20,5 +20,8 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Coverage
+coverage/
+
 # Logs
 *.log
